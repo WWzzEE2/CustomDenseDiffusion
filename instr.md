@@ -1,0 +1,1 @@
+将Diffuser版本pretrain的CustomDiffusion的.bin文件放在ckpt文件夹下再运行gradio_app.py即可

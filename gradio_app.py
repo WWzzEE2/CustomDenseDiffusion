@@ -15,6 +15,7 @@ import diffusers
 from diffusers import DDIMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 import torch.nn.functional as F
+from typing import Optional
 
 from utils import preprocess_mask, process_sketch, process_prompts, process_example
 
@@ -22,9 +23,9 @@ from utils import preprocess_mask, process_sketch, process_prompts, process_exam
 #################################################
 #################################################
 ### check diffusers version
-if diffusers.__version__ != '0.20.2':
-    print("Please use diffusers v0.20.2")
-    sys.exit(0)
+# if diffusers.__version__ != '0.20.2':
+#     print("Please use diffusers v0.20.2")
+#     sys.exit(0)
 
 
 #################################################
@@ -82,14 +83,24 @@ pipe = diffusers.StableDiffusionPipeline.from_pretrained(
         cache_dir='./models/diffusers/',
         use_auth_token=HF_TOKEN).to(device)
 
+pipe.unet.load_attn_procs('./ckpt', weight_name="pytorch_custom_diffusion_weights.bin")
+
+idx = 1
+while True:
+    weight_name = f'<new{idx}>.bin'
+    if not os.path.exists(f'./ckpt/{weight_name}'):
+        break
+    pipe.load_textual_inversion("./ckpt", weight_name=weight_name)
+    idx += 1
+
 pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-pipe.scheduler.set_timesteps(50)
+pipe.scheduler.set_timesteps(100)
 timesteps = pipe.scheduler.timesteps
 sp_sz = pipe.unet.sample_size
 
-with open('./dataset/valset.pkl', 'rb') as f:
+with open('./DenseDiffusion/dataset/valset.pkl', 'rb') as f:
     val_prompt = pickle.load(f)
-val_layout = './dataset/valset_layout/'
+val_layout = './DenseDiffusion/dataset/valset_layout/'
 
 #################################################
 #################################################
@@ -129,7 +140,7 @@ def mod_forward(self, hidden_states, encoder_hidden_states=None, attention_mask=
     key = self.head_to_batch_dim(key)
     value = self.head_to_batch_dim(value)
     
-    if COUNT/32 < 50*0.3:
+    if COUNT/32 < 100*0.3:
         
         dtype = query.dtype
         if self.upcast_attention:
@@ -188,9 +199,122 @@ def mod_forward(self, hidden_states, encoder_hidden_states=None, attention_mask=
 
     return hidden_states
 
+
+def modified_mod_forward(
+    self,
+    hidden_states: torch.FloatTensor,
+    encoder_hidden_states: Optional[torch.FloatTensor] = None,
+    attention_mask: Optional[torch.FloatTensor] = None,
+    temb=None,
+) -> torch.Tensor:
+    
+    processor = self.processor
+    global sreg, creg, COUNT, creg_maps, sreg_maps, reg_sizes, text_cond
+
+    if processor.__class__.__name__ == "CustomDiffusionAttnProcessor":
+        batch_size, sequence_length, _ = hidden_states.shape
+        attention_mask = self.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        if processor.train_q_out:
+            query = processor.to_q_custom_diffusion(hidden_states).to(self.to_q.weight.dtype)
+        else:
+            query = self.to_q(hidden_states.to(self.to_q.weight.dtype))
+
+        if encoder_hidden_states is None:
+            crossattn = False
+            encoder_hidden_states = hidden_states
+        else:
+            crossattn = True
+            # Add:
+            encoder_hidden_states = text_cond
+            if self.norm_cross:
+                encoder_hidden_states = self.norm_encoder_hidden_states(encoder_hidden_states)
+
+        if processor.train_kv:
+            key = processor.to_k_custom_diffusion(encoder_hidden_states.to(processor.to_k_custom_diffusion.weight.dtype))
+            value = processor.to_v_custom_diffusion(encoder_hidden_states.to(processor.to_v_custom_diffusion.weight.dtype))
+            key = key.to(self.to_q.weight.dtype)
+            value = value.to(self.to_q.weight.dtype)
+        else:
+            key = self.to_k(encoder_hidden_states)
+            value = self.to_v(encoder_hidden_states)
+
+        if crossattn:
+            detach = torch.ones_like(key)
+            detach[:, :1, :] = detach[:, :1, :] * 0.0
+            key = detach * key + (1 - detach) * key.detach()
+            value = detach * value + (1 - detach) * value.detach()
+
+        query = self.head_to_batch_dim(query)
+        key = self.head_to_batch_dim(key)
+        value = self.head_to_batch_dim(value)
+    
+        sa_ = not crossattn
+        if COUNT/32 < 100*0.3:
+        
+            dtype = query.dtype
+            if self.upcast_attention:
+                query = query.float()
+                key = key.float()
+                
+            sim = torch.baddbmm(torch.empty(query.shape[0], query.shape[1], key.shape[1], 
+                                            dtype=query.dtype, device=query.device),
+                                query, key.transpose(-1, -2), beta=0, alpha=self.scale)
+            
+            treg = torch.pow(timesteps[COUNT//32]/1000, 5)
+            
+            ## reg at self-attn
+            if sa_:
+                min_value = sim[int(sim.size(0)/2):].min(-1)[0].unsqueeze(-1)
+                max_value = sim[int(sim.size(0)/2):].max(-1)[0].unsqueeze(-1)  
+                mask = sreg_maps[sim.size(1)].repeat(self.heads,1,1)
+                size_reg = reg_sizes[sim.size(1)].repeat(self.heads,1,1)
+                
+                sim[int(sim.size(0)/2):] += (mask>0)*size_reg*sreg*treg*(max_value-sim[int(sim.size(0)/2):])
+                sim[int(sim.size(0)/2):] -= ~(mask>0)*size_reg*sreg*treg*(sim[int(sim.size(0)/2):]-min_value)
+                
+            ## reg at cross-attn
+            else:
+                min_value = sim[int(sim.size(0)/2):].min(-1)[0].unsqueeze(-1)
+                max_value = sim[int(sim.size(0)/2):].max(-1)[0].unsqueeze(-1)  
+                mask = creg_maps[sim.size(1)].repeat(self.heads,1,1)
+                size_reg = reg_sizes[sim.size(1)].repeat(self.heads,1,1)
+                
+                sim[int(sim.size(0)/2):] += (mask>0)*size_reg*creg*treg*(max_value-sim[int(sim.size(0)/2):])
+                sim[int(sim.size(0)/2):] -= ~(mask>0)*size_reg*creg*treg*(sim[int(sim.size(0)/2):]-min_value)
+
+            attention_probs = sim.softmax(dim=-1)
+            attention_probs = attention_probs.to(dtype)
+                
+        else:
+            attention_probs = self.get_attention_scores(query, key, attention_mask)
+            
+        COUNT += 1
+
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = self.batch_to_head_dim(hidden_states)
+
+        if processor.train_q_out:
+            # linear proj
+            hidden_states = processor.to_out_custom_diffusion[0](hidden_states)
+            # dropout
+            hidden_states = processor.to_out_custom_diffusion[1](hidden_states)
+        else:
+            # linear proj
+            hidden_states = self.to_out[0](hidden_states)
+            # dropout
+            hidden_states = self.to_out[1](hidden_states)
+    
+    elif processor.__class__.__name__ == "AttnProcessor2_0":
+        hidden_states = mod_forward(self, hidden_states, encoder_hidden_states, attention_mask, temb)
+    else:
+        raise NotImplementedError()
+
+    return hidden_states
+
+
 for _module in pipe.unet.modules():
     if _module.__class__.__name__ == "Attention":
-        _module.__class__.__call__ = mod_forward
+        _module.__class__.__call__ = modified_mod_forward
 
         
 #################################################
@@ -267,7 +391,7 @@ def process_generation(binary_matrixes, seed, creg_, sreg_, sizereg_, bsz, maste
     else:
         latents = torch.randn(bsz,4,sp_sz,sp_sz, generator=torch.Generator().manual_seed(seed)).to(device)
         
-    image = pipe(prompts[:1]*bsz, latents=latents).images
+    image = pipe(prompts[:1]*bsz, latents=latents, guidance_scale=6.0, eta=1.0, num_inference_steps=100,).images
 
     return(image)
 
